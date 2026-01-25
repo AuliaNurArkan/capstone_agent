@@ -1,8 +1,7 @@
 
 import streamlit as st
 from langchain_core.messages import ToolMessage
-from agent_st.agent import run_agent as agent
-#from agent_st.agent import supervisor_agent as agent
+from agent_st.agent import supervisor_agent as agent
 from langfuse.langchain import CallbackHandler
 
 langfuse_handler = CallbackHandler()

@@ -17,8 +17,8 @@ lf = Langfuse()
 langfuse_handler = CallbackHandler()
 
 qdrant_client = QdrantClient(
-            url=os.getenv("QDRANT_URL"),
-            api_key=os.getenv("QDRANT_API_KEY"),
+    url=os.getenv("QDRANT_URL"),
+    api_key=os.getenv("QDRANT_API_KEY"),
 )
         
 embeddings = OpenAIEmbeddings(
@@ -40,7 +40,6 @@ class AgentInput(BaseModel):
 def search_resume(query: str, k: int = 5) -> list[str]:
     """Retrieve relevant resumes on the query."""
 
-
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=os.getenv("QDRANT_COLLECTION_NAME"),
@@ -53,8 +52,9 @@ def search_resume(query: str, k: int = 5) -> list[str]:
         for idx, result in enumerate(docs):
             formatted_results.append(f"""
 Resume {idx + 1}:
-- ID: {result[0].metadata.get('row_index', 'N/A')}
+- ID: {result[0].metadata.get('resume_id', 'N/A')}
 - Category: {result[0].metadata.get('category', 'N/A')}
+- Section: {result[0].metadata.get('section_type', 'N/A')}
 - Relevance Score: {result[1]:.3f}
 - Content Preview: {result[0].page_content[:300]}...
 """)
@@ -65,8 +65,7 @@ Resume {idx + 1}:
 
 @tool
 def search_resume_skill(query: str, k: int = 5) -> list[str]:
-    """Retrieve relevant resumes on the query."""
-
+    """Retrieve relevant resumes based on skills query."""
 
     vector_store = QdrantVectorStore(
         client=qdrant_client,
@@ -79,7 +78,9 @@ def search_resume_skill(query: str, k: int = 5) -> list[str]:
         formatted_data = []
         for idx, result in enumerate(docs):
             formatted_data.append(f"""
-Resume {idx + 1} ({result[0].metadata.get('row_index', 'N/A')}):
+Resume {idx + 1} (ID: {result[0].metadata.get('resume_id', 'N/A')}):
+Section: {result[0].metadata.get('section_type', 'N/A')}
+Category: {result[0].metadata.get('category', 'N/A')}
 {result[0].page_content[:500]}...
 """)
         
@@ -87,6 +88,56 @@ Resume {idx + 1} ({result[0].metadata.get('row_index', 'N/A')}):
         return context
     return "No relevant documents found."
 
+@tool
+def search_resume_section(query: str, section_filter: str = None, k: int = 5) -> list[str]:
+    """Retrieve specific sections from resumes (e.g., experience, education, projects).
+    
+    Args:
+        query: Search query
+        section_filter: Filter by section type (skills, experience, education, projects, certifications, summary)
+        k: Number of results to return
+    """
+
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=os.getenv("QDRANT_COLLECTION_NAME"),
+        embedding=embeddings,
+    )
+
+    # Build filter if section_filter provided
+    search_kwargs = {"k": k}
+    if section_filter:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        search_kwargs["filter"] = Filter(
+            must=[
+                FieldCondition(
+                    key="section_type",
+                    match=MatchValue(value=section_filter.lower())
+                )
+            ]
+        )
+
+    docs = vector_store.similarity_search_with_score(query, **search_kwargs)
+    
+    if docs:
+        formatted_data = []
+        for idx, result in enumerate(docs):
+            formatted_data.append(f"""
+Resume {idx + 1}:
+- ID: {result[0].metadata.get('resume_id', 'N/A')}
+- Category: {result[0].metadata.get('category', 'N/A')}
+- Section Type: {result[0].metadata.get('section_type', 'N/A').upper()}
+- Relevance Score: {result[1]:.3f}
+- Content:
+{result[0].page_content}
+---
+""")
+        
+        context = "\n".join(formatted_data)
+        return context
+    return f"No relevant {section_filter or 'resume'} sections found."
+
+# Agent 1: Resume Search Agent
 lf_resume_search = lf.get_prompt("resume_search_agent").get_langchain_prompt()
 
 resume_search_agent = create_agent(
@@ -95,6 +146,7 @@ resume_search_agent = create_agent(
     system_prompt=lf_resume_search
 )
 
+# Agent 2: Skill Analyze Agent
 lf_skill_analyze = lf.get_prompt("skill_analyze_agent").get_langchain_prompt()
 
 skill_analyze_agent = create_agent(
@@ -103,40 +155,59 @@ skill_analyze_agent = create_agent(
     system_prompt=lf_skill_analyze
 )
 
-@tool(
-        args_schema=AgentInput
+# Agent 3: Section Search Agent (NEW)
+lf_section_search = lf.get_prompt("section_search_agent").get_langchain_prompt()
+
+section_search_agent = create_agent(
+    model=model,
+    tools=[search_resume_section],
+    system_prompt=lf_section_search
 )
+
+@tool(args_schema=AgentInput)
 def resume_search(query: str, history: str) -> str:
     """Tool to search resumes using the resume search agent.
-    Use this when the user wants to  find/search for specific candidates or resumes
+    Use this when the user wants to find/search for specific candidates or resumes
 
     query: "find HR managers", "search for candidates with X skill".
     history: chat history summary
     """
     result = resume_search_agent.invoke({
-        "messages": [{"role": "user", "content": query + "history chat: " + history}]
+        "messages": [{"role": "user", "content": query + " history chat: " + history}]
     }, config={"callbacks": [langfuse_handler]})
-    return result["messages"][-1].text
+    return result["messages"][-1].content
 
-@tool(
-        args_schema=AgentInput
-)
+@tool(args_schema=AgentInput)
 def skill_analyze(query: str, history: str) -> str:
     """Tool to Analyze skills, create comparisons, identify gaps
     Use when: User asks about skills, wants analysis or comparisons
     
-    query: "what skills does", "compare skills", "skills gap analysis
+    query: "what skills does", "compare skills", "skills gap analysis"
     history: chat history
     """
     result = skill_analyze_agent.invoke({
-        "messages": [{"role": "user", "content": query + "history chat: " + history}]
+        "messages": [{"role": "user", "content": query + " history chat: " + history}]
     }, config={"callbacks": [langfuse_handler]})
-    return result["messages"][-1].text
+    return result["messages"][-1].content
 
+@tool(args_schema=AgentInput)
+def section_search(query: str, history: str) -> str:
+    """Tool to search specific sections in resumes (experience, education, projects, etc.)
+    Use when: User asks about specific resume sections or detailed information from particular sections
+    
+    query: "show me experience sections", "find education background", "what projects have candidates done"
+    history: chat history
+    """
+    result = section_search_agent.invoke({
+        "messages": [{"role": "user", "content": query + " history chat: " + history}]
+    }, config={"callbacks": [langfuse_handler]})
+    return result["messages"][-1].content
+
+# Supervisor Agent
 lf_supervisor = lf.get_prompt("supervisor_agent").get_langchain_prompt()
-# supervisor
+
 supervisor_agent = create_agent(
     model=model,
-    tools=[search_resume, search_resume_skill],
+    tools=[resume_search, skill_analyze, section_search],
     system_prompt=lf_supervisor
 )
