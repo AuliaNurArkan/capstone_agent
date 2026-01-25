@@ -9,7 +9,8 @@ from langfuse.langchain import CallbackHandler
 from dotenv import load_dotenv
 import os
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langchain.agents import create_react_agent
+from langgraph.prebuilt import create_react_agent
+#from langchain.agents import create_react_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from typing import Literal, Optional, List, TypedDict
 from pydantic import BaseModel, Field
