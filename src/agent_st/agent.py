@@ -3,106 +3,16 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain_openai.chat_models import ChatOpenAI
 from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchAny
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
 from dotenv import load_dotenv
 import os
-from langchain.agents import create_agent
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langchain.agents import create_react_agent
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from typing import Literal, Optional, List, TypedDict
 from pydantic import BaseModel, Field
-from typing import Literal
-
-load_dotenv()
-
-lf = Langfuse()
-langfuse_handler = CallbackHandler()
-
-qdrant_client = QdrantClient(
-            url=os.getenv("QDRANT_URL"),
-            api_key=os.getenv("QDRANT_API_KEY"),
-)
-        
-embeddings = OpenAIEmbeddings(
-    model=os.getenv("EMBEDDING_MODEL"),
-    openai_api_key=os.getenv("OPENAI_API_KEY")
-)
-
-model = ChatOpenAI(
-    model=os.getenv("LLM_MODEL"),
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-)
-
-class AgentInput(BaseModel):
-    """Input for search resume."""
-    query: str = Field(description="Search query from user")
-    history: str = Field(description="summary of chat history")
-
-@tool
-def search_resume(query: str, k: int = 5) -> list[str]:
-    """Retrieve relevant resumes on the query."""
-
-
-    vector_store = QdrantVectorStore(
-        client=qdrant_client,
-        collection_name=os.getenv("QDRANT_COLLECTION_NAME"),
-        embedding=embeddings,
-    )
-
-    docs = vector_store.similarity_search_with_score(query, k=k)
-    if docs:
-        formatted_results = []
-        for idx, result in enumerate(docs):
-            formatted_results.append(f"""
-Resume {idx + 1}:
-- ID: {result[0].metadata.get('row_index', 'N/A')}
-- Category: {result[0].metadata.get('category', 'N/A')}
-- Relevance Score: {result[1]:.3f}
-- Content Preview: {result[0].page_content[:300]}...
-""")
-        
-        context = "\n".join(formatted_results)
-        return context
-    return "No relevant documents found."
-
-@tool
-def search_resume_skill(query: str, k: int = 5) -> list[str]:
-    """Retrieve relevant resumes on the query."""
-
-
-    vector_store = QdrantVectorStore(
-        client=qdrant_client,
-        collection_name=os.getenv("QDRANT_COLLECTION_NAME"),
-        embedding=embeddings,
-    )
-
-    docs = vector_store.similarity_search_with_score(query, k=k)
-    if docs:
-        formatted_data = []
-        for idx, result in enumerate(docs):
-            formatted_data.append(f"""
-Resume {idx + 1} ({result[0].metadata.get('row_index', 'N/A')}):
-{result[0].page_content[:500]}...
-""")
-        
-        context = "\n".join(formatted_data)
-        return context
-    return "No relevant documents found."
-
-lf_resume_search = lf.get_prompt("resume_search_agent").get_langchain_prompt()
-import os
-from typing import Annotated, List, Union, TypedDict, Literal
-from dotenv import load_dotenv
-
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient, models
-from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_community.callbacks import get_openai_callback
-from langfuse.langchain import CallbackHandler
-from langfuse import Langfuse
 
 load_dotenv()
 
@@ -113,7 +23,7 @@ qdrant_client = QdrantClient(
     url=os.getenv("QDRANT_URL"),
     api_key=os.getenv("QDRANT_API_KEY"),
 )
-        
+
 embeddings = OpenAIEmbeddings(
     model=os.getenv("EMBEDDING_MODEL"),
     openai_api_key=os.getenv("OPENAI_API_KEY")
@@ -122,191 +32,299 @@ embeddings = OpenAIEmbeddings(
 model = ChatOpenAI(
     model=os.getenv("LLM_MODEL"),
     openai_api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=0
 )
 
-# --- TOOLS DEFINITION (SECTION-AWARE) ---
+# Token usage tracker
+class TokenUsage:
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+    
+    def add_usage(self, response):
+        if hasattr(response, 'response_metadata'):
+            usage = response.response_metadata.get('token_usage', {})
+            self.prompt_tokens += usage.get('prompt_tokens', 0)
+            self.completion_tokens += usage.get('completion_tokens', 0)
+            self.total_tokens += usage.get('total_tokens', 0)
+    
+    def reset(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+    
+    def get_usage(self):
+        return {
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'total_tokens': self.total_tokens
+        }
 
-@tool
-def resume_search_tool(query: str, section_filter: List[str] = None):
-    """
-    Search the resume database deeply. 
-    Use 'section_filter' to narrow down results to: ['EXPERIENCE', 'SKILLS', 'EDUCATION', 'SUMMARY'].
-    Results are returned at the chunk level with full metadata.
-    """
-    qdrant_filter = None
-    if section_filter:
-        qdrant_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="metadata.section",
-                    match=models.MatchAny(any=section_filter)
-                )
-            ]
-        )
+token_usage = TokenUsage()
 
+class ResumeSearchInput(BaseModel):
+    """Input for resume search tool."""
+    query: str = Field(description="Search query from user")
+    section_filter: Optional[List[str]] = Field(default=None, description="List of sections to filter (e.g., ['EXPERIENCE', 'SKILLS'])")
+
+@tool(args_schema=ResumeSearchInput)
+def resume_search_tool(query: str, section_filter: Optional[List[str]] = None) -> str:
+    """Retrieve relevant resume chunks based on the query.
+    
+    Apply section filter if provided to narrow down results.
+    Returns chunk-level results with metadata.
+    """
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=os.getenv("QDRANT_COLLECTION_NAME"),
         embedding=embeddings,
     )
-
-    # Retrieval: Fetching 6 most relevant chunks
-    docs = vector_store.similarity_search(query, k=6, filter=qdrant_filter)
     
-    formatted_results = []
-    for doc in docs:
-        res_id = doc.metadata.get("resume_id", "N/A")
-        sec = doc.metadata.get("section", "GENERAL")
-        # Prepending labels so the LLM understands the context of the fragmented text
-        content = f"[RESUME_ID: {res_id} | SECTION: {sec}]\n{doc.page_content}"
-        formatted_results.append(content)
+    # Apply section filter if provided
+    qdrant_filter = None
+    if section_filter:
+        qdrant_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="section",
+                    match=MatchAny(any=section_filter)
+                )
+            ]
+        )
     
-    return "\n\n---\n\n".join(formatted_results) if formatted_results else "No relevant data found."
+    # Retrieve chunks with similarity search
+    docs = vector_store.similarity_search_with_score(
+        query, 
+        k=10,
+        filter=qdrant_filter
+    )
+    
+    if docs:
+        formatted_results = []
+        for idx, (doc, score) in enumerate(docs):
+            formatted_results.append(f"""
+Chunk {idx + 1}:
+- Resume ID: {doc.metadata.get('resume_id', 'N/A')}
+- Category: {doc.metadata.get('category', 'N/A')}
+- Section: {doc.metadata.get('section', 'N/A')}
+- Chunk Index: {doc.metadata.get('chunk_index', 'N/A')}
+- Relevance Score: {score:.3f}
+- Content: {doc.page_content}
+""")
+        
+        context = "\n".join(formatted_results)
+        return context
+    return "No relevant documents found."
 
-# --- AGENT STATE & SUB-AGENTS ---
-
-class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], "Conversation history"]
+# Agent state definition
+class AgentState(MessagesState):
     next_agent: str
 
-# 1. Specialist: Work Experience & Education
-resume_spec_prompt = (
-    "You are an HR Expert specializing in work history and education analysis. "
-    "Your task is to analyze candidate experiences in detail. "
-    "You MUST use 'resume_search_tool' with filters ['EXPERIENCE', 'EDUCATION', 'SUMMARY']. "
-    "CRITICAL: Since data is stored in chunks, group and synthesize information by the same RESUME_ID "
-    "to provide a coherent narrative of a candidate's background."
-)
+# Supervisor prompt
+supervisor_prompt = """You are a supervisor agent that routes user queries to specialized agents.
+
+Your ONLY job is to analyze the user's intent and route to the appropriate agent:
+- Use 'resume_specialist' for queries about experience, employment history, education background
+- Use 'skill_analyst' for queries about technical skills, certifications, competencies
+- Use 'FINISH' when the task is complete or no agent is needed
+
+DO NOT retrieve data yourself. DO NOT perform deep reasoning.
+Simply analyze and route.
+
+Based on the user query and chat history, decide which agent should handle this task."""
+
+# Resume specialist prompt
+resume_specialist_prompt = """You are a Resume Specialist Agent.
+
+You handle queries about:
+- Work experience and employment history
+- Education background
+- Career progression
+- Job roles and responsibilities
+
+IMPORTANT INSTRUCTIONS:
+1. Use the resume_search_tool with appropriate section_filter:
+   - For experience queries: section_filter=['EXPERIENCE', 'WORK EXPERIENCE', 'EMPLOYMENT']
+   - For education queries: section_filter=['EDUCATION']
+   
+2. Remember that data is stored at CHUNK LEVEL:
+   - Multiple chunks may belong to the same resume
+   - Group chunks by resume_id before providing answers
+   - Synthesize information across chunks for complete answers
+   
+3. If a chunk has section='GENERAL':
+   - Explicitly inform the user that the context is generic
+   - Mention that specific section information may be limited
+   
+4. Avoid overconfident conclusions if information is incomplete
+5. Always provide resume_id in your responses for reference
+
+Provide clear, structured answers based on the retrieved chunks."""
+
+# Skill analyst prompt
+skill_analyst_prompt = """You are a Skill Analyst Agent.
+
+You handle queries about:
+- Technical skills and competencies
+- Certifications and qualifications
+- Skill comparisons and gap analysis
+- Technology expertise
+
+IMPORTANT INSTRUCTIONS:
+1. Use the resume_search_tool with section_filter=['SKILLS', 'TECHNICAL SKILLS'] for skill queries
+
+2. Remember that data is stored at CHUNK LEVEL:
+   - Multiple chunks may belong to the same resume
+   - Group chunks by resume_id before analyzing skills
+   - Synthesize skill information across chunks
+   
+3. For skill analysis:
+   - Extract all relevant skills from retrieved chunks
+   - Group by resume_id for comparisons
+   - Identify patterns and gaps if requested
+   
+4. If a chunk has section='GENERAL':
+   - Note that skills may be mentioned in general context
+   - Look for both explicit and implicit skill mentions
+   
+5. Provide structured skill analysis with resume_id references
+
+Be thorough and analytical in your skill assessments."""
+
+# Create specialized agents
 resume_specialist_agent = create_react_agent(
-    model, tools=[resume_search_tool], state_modifier=resume_spec_prompt
+    model=model,
+    tools=[resume_search_tool],
+    state_modifier=SystemMessage(content=resume_specialist_prompt)
 )
 
-# 2. Specialist: Skill Analysis
-skill_analyst_prompt = (
-    "You are a Technical Recruiter specializing in skill assessments and certifications. "
-    "Your task is to identify technical competencies or perform skill gap analysis. "
-    "You MUST use 'resume_search_tool' with filters ['SKILLS']. "
-    "Compare skills across candidates if requested. Always link skills to their respective RESUME_ID."
-)
 skill_analyst_agent = create_react_agent(
-    model, tools=[resume_search_tool], state_modifier=skill_analyst_prompt
+    model=model,
+    tools=[resume_search_tool],
+    state_modifier=SystemMessage(content=skill_analyst_prompt)
 )
 
-# --- SUPERVISOR LOGIC ---
-
-class SupervisorOutput(TypedDict):
-    next_agent: Union[Literal["resume_specialist", "skill_analyst", "FINISH"]]
-
+# Supervisor routing function
 def supervisor_node(state: AgentState):
-    """Decides which specialized agent should handle the user request."""
-    system_prompt = (
-        "You are the HR Agent Supervisor. Your job is to delegate tasks based on user intent: \n"
-        "- If the query is about work experience, career history, or education -> route to 'resume_specialist'.\n"
-        "- If the query is about technical skills, tools, or specific competencies -> route to 'skill_analyst'.\n"
-        "- If you have gathered enough information to provide a comprehensive final answer -> choose 'FINISH'."
-    )
     messages = state["messages"]
-    response = model.with_structured_output(SupervisorOutput).invoke(
-        [{"role": "system", "content": system_prompt}] + messages,
-        config={"callbacks": [langfuse_handler]}
-    )
-    return {"next_agent": response["next_agent"]}
+    
+    # Create routing prompt
+    routing_prompt = f"{supervisor_prompt}\n\nConversation:\n"
+    for msg in messages[-5:]:  # Last 5 messages for context
+        if isinstance(msg, HumanMessage):
+            routing_prompt += f"User: {msg.content}\n"
+        elif isinstance(msg, AIMessage):
+            routing_prompt += f"Assistant: {msg.content}\n"
+    
+    routing_prompt += "\n\nRoute to: resume_specialist, skill_analyst, or FINISH?"
+    
+    response = model.invoke([SystemMessage(content=routing_prompt)])
+    token_usage.add_usage(response)
+    
+    content = response.content.lower()
+    
+    if "resume_specialist" in content or "experience" in content or "education" in content:
+        next_agent = "resume_specialist"
+    elif "skill_analyst" in content or "skill" in content:
+        next_agent = "skill_analyst"
+    else:
+        next_agent = "FINISH"
+    
+    return {"next_agent": next_agent}
 
-# --- GRAPH CONSTRUCTION ---
+# Resume specialist node
+def resume_specialist_node(state: AgentState):
+    result = resume_specialist_agent.invoke(state)
+    
+    # Track tokens from agent response
+    if result.get("messages"):
+        last_msg = result["messages"][-1]
+        if hasattr(last_msg, 'response_metadata'):
+            token_usage.add_usage(last_msg)
+    
+    return {"messages": result["messages"]}
 
+# Skill analyst node
+def skill_analyst_node(state: AgentState):
+    result = skill_analyst_agent.invoke(state)
+    
+    # Track tokens from agent response
+    if result.get("messages"):
+        last_msg = result["messages"][-1]
+        if hasattr(last_msg, 'response_metadata'):
+            token_usage.add_usage(last_msg)
+    
+    return {"messages": result["messages"]}
+
+# Routing logic
+def route_after_supervisor(state: AgentState) -> Literal["resume_specialist", "skill_analyst", "__end__"]:
+    next_agent = state.get("next_agent", "FINISH")
+    
+    if next_agent == "resume_specialist":
+        return "resume_specialist"
+    elif next_agent == "skill_analyst":
+        return "skill_analyst"
+    else:
+        return "__end__"
+
+# Build the graph
 workflow = StateGraph(AgentState)
 
+# Add nodes
 workflow.add_node("supervisor", supervisor_node)
-workflow.add_node("resume_specialist", lambda state: resume_specialist_agent.invoke(state, config={"callbacks": [langfuse_handler]}))
-workflow.add_node("skill_analyst", lambda state: skill_analyst_agent.invoke(state, config={"callbacks": [langfuse_handler]}))
+workflow.add_node("resume_specialist", resume_specialist_node)
+workflow.add_node("skill_analyst", skill_analyst_node)
 
-workflow.set_entry_point("supervisor")
-
-def router(state):
-    if state["next_agent"] == "FINISH":
-        return END
-    return state["next_agent"]
-
-workflow.add_conditional_edges("supervisor", router)
-workflow.add_edge("resume_specialist", "supervisor")
-workflow.add_edge("skill_analyst", "supervisor")
-
-memory = MemorySaver()
-app = workflow.compile(checkpointer=memory)
-
-# --- HELPER FUNCTION FOR STREAMLIT + TOKEN TRACKING ---
-
-def ask_agent_with_stats(query: str, thread_id: str):
-    """
-    Main function for Streamlit UI. Returns final answer and usage statistics.
-    """
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "callbacks": [langfuse_handler]
+# Add edges
+workflow.add_edge(START, "supervisor")
+workflow.add_conditional_edges(
+    "supervisor",
+    route_after_supervisor,
+    {
+        "resume_specialist": "resume_specialist",
+        "skill_analyst": "skill_analyst",
+        "__end__": END
     }
-    inputs = {"messages": [HumanMessage(content=query)]}
-    
-    with get_openai_callback() as cb:
-        result = app.invoke(inputs, config=config)
-        final_message = result["messages"][-1].content
-        
-        stats = {
-            "total_tokens": cb.total_tokens,
-            "prompt_tokens": cb.prompt_tokens,
-            "completion_tokens": cb.completion_tokens,
-            "total_cost": cb.total_cost
-        }
-    
-    return final_message, stats
-resume_search_agent = create_agent(
-    model=model,
-    tools=[search_resume],
-    system_prompt=lf_resume_search
 )
+workflow.add_edge("resume_specialist", END)
+workflow.add_edge("skill_analyst", END)
 
-lf_skill_analyze = lf.get_prompt("skill_analyze_agent").get_langchain_prompt()
+# Compile the graph
+graph = workflow.compile()
 
-skill_analyze_agent = create_agent(
-    model=model,
-    tools=[search_resume_skill],
-    system_prompt=lf_skill_analyze
-)
-
-@tool(
-        args_schema=AgentInput
-)
-def resume_search(query: str, history: str) -> str:
-    """Tool to search resumes using the resume search agent.
-    Use this when the user wants to  find/search for specific candidates or resumes
-
-    query: "find HR managers", "search for candidates with X skill".
-    history: chat history summary
+# Main agent interface
+def run_agent(user_query: str, chat_history: List = None):
     """
-    result = resume_search_agent.invoke({
-        "messages": [{"role": "user", "content": query + "history chat: " + history}]
-    }, config={"callbacks": [langfuse_handler]})
-    return result["messages"][-1].text
-
-@tool(
-        args_schema=AgentInput
-)
-def skill_analyze(query: str, history: str) -> str:
-    """Tool to Analyze skills, create comparisons, identify gaps
-    Use when: User asks about skills, wants analysis or comparisons
+    Main function to run the agent with chat history support.
     
-    query: "what skills does", "compare skills", "skills gap analysis
-    history: chat history
+    Args:
+        user_query: User's question or query
+        chat_history: List of previous messages
+    
+    Returns:
+        Response from the agent and token usage
     """
-    result = skill_analyze_agent.invoke({
-        "messages": [{"role": "user", "content": query + "history chat: " + history}]
-    }, config={"callbacks": [langfuse_handler]})
-    return result["messages"][-1].text
-
-lf_supervisor = lf.get_prompt("supervisor_agent").get_langchain_prompt()
-# supervisor
-supervisor_agent = create_agent(
-    model=model,
-    tools=[search_resume, search_resume_skill],
-    system_prompt=lf_supervisor
-)
+    token_usage.reset()
+    
+    messages = []
+    
+    # Add chat history (last 3 conversations)
+    if chat_history:
+        messages.extend(chat_history[-6:])  # Last 3 user-assistant pairs
+    
+    # Add current query
+    messages.append(HumanMessage(content=user_query))
+    
+    # Invoke the graph
+    result = graph.invoke(
+        {"messages": messages},
+        config={"callbacks": [langfuse_handler]}
+    )
+    
+    # Extract final response
+    final_message = result["messages"][-1].content
+    
+    return {
+        "response": final_message,
+        "token_usage": token_usage.get_usage()
+    }
