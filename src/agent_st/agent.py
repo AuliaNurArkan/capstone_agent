@@ -215,6 +215,9 @@ Resume {idx + 1}:
 def verify_resume_info(query: str, k: int = 3) -> list[str]:
     """Verify or validate information about candidates mentioned in conversation.
     
+    IMPORTANT: This tool returns RAW DATA for analysis.
+    DO NOT show all results to user. Extract only the answer to their specific question.
+    
     Args:
         query: Verification query with candidate context
         k: Number of results to retrieve for verification
@@ -241,9 +244,12 @@ Verification Result {idx + 1}:
 {result[0].page_content}
 ---
 """)
-        
+            
         context = "\n".join(formatted_data)
-        return context
+        # ✅ TAMBAHKAN INSTRUKSI DI OUTPUT
+        return f"""[ANALYSIS DATA - DO NOT SHOW ALL TO USER]
+        {context}
+        [INSTRUCTION TO AGENT: Read the above data and answer ONLY the user's specific question. Be concise (2-3 sentences). DO NOT list all verification results.]"""
     return "No information found to verify the statement."
 
 
@@ -339,12 +345,27 @@ def verify_statement(query: str, history: str) -> str:
     query: "is this candidate 5 years experience?", "does candidate have AWS cert?", "verify their education"
     history: chat history with candidate context
     """
-    # Summarize history if too long
+    # Extract candidate IDs dari history
     history_summary = summarize_history(history, max_length=200)
     
+    # Extract IDs yang disebutkan di history
+    candidate_ids = re.findall(r'(?:ID|id|Resume)\s*:?\s*(\d+)', history)
+    
+    # Build enhanced query
+    enhanced_query = query
+    if candidate_ids:
+        unique_ids = list(set(candidate_ids))[:3]  # Max 3 IDs
+        enhanced_query = f"{query}\n\nContext: Asking about Resume IDs: {', '.join(unique_ids)}\n\n{history_summary}"
+    else:
+        enhanced_query = f"{query}\n\n{history_summary}"
+    
+    # Instruksi eksplisit ke nested agent
+    enhanced_query += "\n\nIMPORTANT: Provide a SHORT, DIRECT answer (2-3 sentences). DO NOT list all verification results."
+    
     result = verification_agent.invoke({
-        "messages": [{"role": "user", "content": f"{query}\n\n{history_summary}"}]
+        "messages": [{"role": "user", "content": enhanced_query}]
     }, config={"callbacks": [langfuse_handler]})
+    
     return result["messages"][-1].content
 
 # Supervisor Agent
