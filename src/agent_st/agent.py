@@ -271,16 +271,17 @@ skill_analyze_agent = create_agent(
     system_prompt=lf_skill_analyze
 )
 
-# Agent 3: Section Search Agent
-lf_section_search = lf.get_prompt("section_search_agent").get_langchain_prompt()
+# NON AKTIF
+# # Agent ...: Section Search Agent
+# lf_section_search = lf.get_prompt("section_search_agent").get_langchain_prompt()
 
-section_search_agent = create_agent(
-    model=model,
-    tools=[search_resume_section],
-    system_prompt=lf_section_search
-)
+# section_search_agent = create_agent(
+#     model=model,
+#     tools=[search_resume_section],
+#     system_prompt=lf_section_search
+#)
 
-# Agent 4: Verification Agent
+# Agent 3: Verification Agent
 lf_verification = lf.get_prompt("verification_agent").get_langchain_prompt()
 
 verification_agent = create_agent(
@@ -321,21 +322,21 @@ def skill_analyze(query: str, history: str) -> str:
     }, config={"callbacks": [langfuse_handler]})
     return result["messages"][-1].content
 
-@tool(args_schema=AgentInput)
-def section_search(query: str, history: str) -> str:
-    """Tool to search specific sections in resumes (experience, education, projects, etc.)
-    Use when: User asks about specific resume sections or detailed information from particular sections
+# @tool(args_schema=AgentInput)
+# def section_search(query: str, history: str) -> str:
+#     """Tool to search specific sections in resumes (experience, education, projects, etc.)
+#     Use when: User asks about specific resume sections or detailed information from particular sections
     
-    query: "show me experience sections", "find education background", "what projects have candidates done"
-    history: chat history
-    """
-    # Summarize history if too long
-    history_summary = summarize_history(history, max_length=200)
+#     query: "show me experience sections", "find education background", "what projects have candidates done"
+#     history: chat history
+#     """
+#     # Summarize history if too long
+#     history_summary = summarize_history(history, max_length=200)
     
-    result = section_search_agent.invoke({
-        "messages": [{"role": "user", "content": f"{query}\n\n{history_summary}"}]
-    }, config={"callbacks": [langfuse_handler]})
-    return result["messages"][-1].content
+#     result = section_search_agent.invoke({
+#         "messages": [{"role": "user", "content": f"{query}\n\n{history_summary}"}]
+#     }, config={"callbacks": [langfuse_handler]})
+#     return result["messages"][-1].content
 
 @tool(args_schema=AgentInput)
 def verify_statement(query: str, history: str) -> str:
@@ -373,6 +374,6 @@ lf_supervisor = lf.get_prompt("supervisor_agent").get_langchain_prompt()
 
 supervisor_agent = create_agent(
     model=model,
-    tools=[resume_search, skill_analyze, section_search, verify_statement],
+    tools=[resume_search, skill_analyze, verify_statement],
     system_prompt=lf_supervisor
 )
